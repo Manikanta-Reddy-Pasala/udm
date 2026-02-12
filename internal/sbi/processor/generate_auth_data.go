@@ -38,22 +38,26 @@ const (
 )
 
 func (p *Processor) aucSQN(opc, k, auts, rand []byte) ([]byte, []byte) {
-	// Use ValidateAUTS to verify AUTS and extract SQNms
-	// This function internally:
-	// 1. Uses AK* (f5*) to de-conceal SQNms from AUTS
-	// 2. Computes MAC-S with AMF=0x0000 and verifies it
+	logger.UeauLog.Debugf("[SQN-Resync] aucSQN called: AUTS=[%x], RAND=[%x]", auts, rand)
+	logger.UeauLog.Debugf("[SQN-Resync] aucSQN: AUTS[0:6] (encrypted SQN) = [%x]", auts[0:6])
+	logger.UeauLog.Debugf("[SQN-Resync] aucSQN: AUTS[6:14] (MAC-S from UE) = [%x]", auts[6:14])
+
+	// ValidateAUTS internally:
+	// 1. Computes AK* = f5*(K, RAND) to de-conceal SQN
+	// 2. SQNms = AUTS[0:6] XOR AK*
+	// 3. Computes XMAC-S = f1*(K, SQNms, RAND, AMF=0x0000)
+	// 4. Verifies XMAC-S == AUTS[6:14]
 	SQNms, _, err := milenage.ValidateAUTS(opc, k, rand, auts)
 	if err != nil {
-		logger.UeauLog.Errorln("aucSQN ValidateAUTS err:", err)
+		logger.UeauLog.Errorf("[SQN-Resync] aucSQN: ValidateAUTS FAILED: %v", err)
 		return nil, nil
 	}
 
-	logger.UeauLog.Tracef("aucSQN: SQNms=[%x]\n", SQNms)
+	logger.UeauLog.Infof("[SQN-Resync] aucSQN: MAC-S verified OK")
+	logger.UeauLog.Infof("[SQN-Resync] aucSQN: Decrypted SQNms = [%x] (decimal %d)",
+		SQNms, new(big.Int).SetBytes(SQNms).Int64())
 
-	// Extract MAC-S from AUTS for logging (optional)
 	macS := auts[6:14]
-	logger.UeauLog.Tracef("aucSQN: macS=[%x]\n", macS)
-
 	return SQNms, macS
 }
 
@@ -104,7 +108,6 @@ func (p *Processor) ConfirmAuthDataProcedure(c *gin.Context,
 		return
 	}
 
-	// AuthEvent in response body is optional
 	c.JSON(http.StatusCreated, gin.H{})
 }
 
@@ -238,7 +241,6 @@ func (p *Processor) GenerateAuthDataProcedure(
 	}
 
 	sqnStr := p.strictHex(authSubs.AuthenticationSubscription.SequenceNumber.Sqn, 12)
-	logger.UeauLog.Traceln("sqnStr", sqnStr)
 	sqn, err := hex.DecodeString(sqnStr)
 	if err != nil {
 		problemDetails := &models.ProblemDetails{
@@ -253,7 +255,11 @@ func (p *Processor) GenerateAuthDataProcedure(
 		return
 	}
 
-	logger.UeauLog.Tracef("K=[%x], sqn=[%x], OP=[%x], OPC=[%x]", k, sqn, op, opc)
+	// ── Auth flow log: credentials loaded from DB ──
+	isResync := authInfoRequest.ResynchronizationInfo != nil
+	logger.UeauLog.Infof("[Auth] ── Begin GenerateAuthData for %s (resync=%v) ──", supiOrSuci, isResync)
+	logger.UeauLog.Infof("[Auth] K=[%s], OPC=[%s]", kStr, opcStr)
+	logger.UeauLog.Infof("[Auth] DB SQN (before)=[%s] (decimal %d)", sqnStr, new(big.Int).SetBytes(sqn).Int64())
 
 	RAND := make([]byte, 16)
 	_, err = cryptoRand.Read(RAND)
@@ -271,7 +277,6 @@ func (p *Processor) GenerateAuthDataProcedure(
 	}
 
 	amfStr := p.strictHex(authSubs.AuthenticationSubscription.AuthenticationManagementField, 4)
-	logger.UeauLog.Traceln("amfStr", amfStr)
 	AMF, err := hex.DecodeString(amfStr)
 	if err != nil {
 		problemDetails := &models.ProblemDetails{
@@ -286,11 +291,12 @@ func (p *Processor) GenerateAuthDataProcedure(
 		return
 	}
 
-	logger.UeauLog.Tracef("RAND=[%x], AMF=[%x]", RAND, AMF)
+	logger.UeauLog.Infof("[Auth] RAND=[%x], AMF=[%x]", RAND, AMF)
 
 	// re-synchronization
 	if authInfoRequest.ResynchronizationInfo != nil {
-		logger.UeauLog.Infof("Authentication re-synchronization")
+		logger.UeauLog.Infof("[SQN-Resync] ══════════════════════════════════════")
+		logger.UeauLog.Infof("[SQN-Resync] Re-synchronization triggered for %s", supiOrSuci)
 
 		Auts, deCodeErr := hex.DecodeString(authInfoRequest.ResynchronizationInfo.Auts)
 		if deCodeErr != nil {
@@ -320,8 +326,20 @@ func (p *Processor) GenerateAuthDataProcedure(
 			return
 		}
 
+		logger.UeauLog.Infof("[SQN-Resync] AUTS from UE      = [%x] (14 bytes)", Auts)
+		logger.UeauLog.Infof("[SQN-Resync]   AUTS[0:6]  (encrypted SQN = SQNms XOR AK*) = [%x]", Auts[0:6])
+		logger.UeauLog.Infof("[SQN-Resync]   AUTS[6:14] (MAC-S = f1*)                   = [%x]", Auts[6:])
+		logger.UeauLog.Infof("[SQN-Resync] RAND (from failed auth) = [%x]", randHex)
+		logger.UeauLog.Infof("[SQN-Resync] Decrypting: AK* = f5*(K, RAND), SQNms = AUTS[0:6] XOR AK*")
+
 		SQNms, macS := p.aucSQN(opc, k, Auts, randHex)
 		if reflect.DeepEqual(macS, Auts[6:]) {
+			logger.UeauLog.Infof("[SQN-Resync] ✓ MAC-S verified: f1*(SQNms, RAND, AMF=0x0000) matches AUTS[6:14]")
+			logger.UeauLog.Infof("[SQN-Resync] Decrypted SQNms = [%x] (decimal %d)",
+				SQNms, new(big.Int).SetBytes(SQNms).Int64())
+			logger.UeauLog.Infof("[SQN-Resync] DB SQN was      = [%s] (decimal %d) ← stale/mismatched",
+				sqnStr, new(big.Int).SetBytes(sqn).Int64())
+
 			_, err = cryptoRand.Read(RAND)
 			if err != nil {
 				problemDetails := &models.ProblemDetails{
@@ -339,13 +357,16 @@ func (p *Processor) GenerateAuthDataProcedure(
 			// Re-sync: use SQN decoded from UE's AUTS (SQNms)
 			// The post-resync increment block below will add +1
 			sqnStr = hex.EncodeToString(SQNms)
-			logger.UeauLog.Tracef("Re-sync SQNms=[%s]", sqnStr)
 			sqnStr = p.strictHex(sqnStr, 12)
+			logger.UeauLog.Infof("[SQN-Resync] Using UE's SQNms = [%s] as base (will increment +1 below)", sqnStr)
+			logger.UeauLog.Infof("[SQN-Resync] New RAND for auth vector = [%x]", RAND)
+			logger.UeauLog.Infof("[SQN-Resync] ══════════════════════════════════════")
 		} else {
-			logger.UeauLog.Errorf("Re-Sync MAC failed for UE with identity supiOrSuci=[%s], resolvedSupi=[%s]", supiOrSuci, supi)
-			logger.UeauLog.Errorln("MACS ", macS)
-			logger.UeauLog.Errorln("Auts[6:] ", Auts[6:])
-			logger.UeauLog.Errorln("Sqn ", SQNms)
+			logger.UeauLog.Errorf("[SQN-Resync] ✗ MAC-S verification FAILED for %s (supi=%s)", supiOrSuci, supi)
+			logger.UeauLog.Errorf("[SQN-Resync]   Computed MAC-S = [%x]", macS)
+			logger.UeauLog.Errorf("[SQN-Resync]   AUTS MAC-S     = [%x]", Auts[6:])
+			logger.UeauLog.Errorf("[SQN-Resync]   Decrypted SQN  = [%x]", SQNms)
+			logger.UeauLog.Errorf("[SQN-Resync] ══════════════════════════════════════")
 			problemDetails := &models.ProblemDetails{
 				Status: http.StatusForbidden,
 				Cause:  "modification is rejected",
@@ -356,7 +377,8 @@ func (p *Processor) GenerateAuthDataProcedure(
 		}
 	}
 
-	// increment sqn
+	// ── Increment SQN ──
+	sqnBeforeIncrement := sqnStr
 	bigSQN := big.NewInt(0)
 	sqn, err = hex.DecodeString(sqnStr)
 	if err != nil {
@@ -379,6 +401,12 @@ func (p *Processor) GenerateAuthDataProcedure(
 
 	SQNheStr := fmt.Sprintf("%x", bigSQN)
 	SQNheStr = p.strictHex(SQNheStr, 12)
+
+	logger.UeauLog.Infof("[Auth] SQN increment: [%s] → [%s] (decimal %d → %d)",
+		sqnBeforeIncrement, SQNheStr,
+		new(big.Int).SetBytes(sqn).Int64(),
+		bigSQN.Int64())
+
 	patchItemArray := []models.PatchItem{
 		{
 			Op:   models.PatchOperation_REPLACE,
@@ -409,6 +437,8 @@ func (p *Processor) GenerateAuthDataProcedure(
 		return
 	}
 
+	logger.UeauLog.Infof("[Auth] SQN saved to DB: [%s]", SQNheStr)
+
 	// Run milenage
 	macA, macS := make([]byte, 8), make([]byte, 8)
 	CK, IK := make([]byte, 16), make([]byte, 16)
@@ -422,23 +452,27 @@ func (p *Processor) GenerateAuthDataProcedure(
 	}
 
 	// Generate RES, CK, IK, AK, AKstar
-	// RES == XRES (expected RES) for server
 	err = util.MilenageF2345(opc, k, RAND, RES, CK, IK, AK, AKstar)
 	if err != nil {
 		logger.UeauLog.Errorln("milenage F2345 err:", err)
 	}
-	logger.UeauLog.Tracef("milenage RES=[%s]", hex.EncodeToString(RES))
 
 	// Generate AUTN
-	logger.UeauLog.Tracef("SQN=[%x], AK=[%x]", sqn, AK)
-	logger.UeauLog.Tracef("AMF=[%x], macA=[%x]", AMF, macA)
 	SQNxorAK := make([]byte, 6)
 	for i := 0; i < len(sqn); i++ {
 		SQNxorAK[i] = sqn[i] ^ AK[i]
 	}
-	logger.UeauLog.Tracef("SQN xor AK=[%x]", SQNxorAK)
 	AUTN := append(append(SQNxorAK, AMF...), macA...)
-	logger.UeauLog.Tracef("AUTN=[%x]", AUTN)
+
+	logger.UeauLog.Infof("[Auth] ── Auth vector generated ──")
+	logger.UeauLog.Infof("[Auth]   SQN used     = [%x] (decimal %d)", sqn, new(big.Int).SetBytes(sqn).Int64())
+	logger.UeauLog.Infof("[Auth]   RAND         = [%x]", RAND)
+	logger.UeauLog.Infof("[Auth]   AK (f5)      = [%x]", AK)
+	logger.UeauLog.Infof("[Auth]   SQN XOR AK   = [%x]  ← encrypted SQN in AUTN", SQNxorAK)
+	logger.UeauLog.Infof("[Auth]   MAC-A (f1)   = [%x]", macA)
+	logger.UeauLog.Infof("[Auth]   AUTN         = [%x]  (SQN^AK || AMF || MAC-A)", AUTN)
+	logger.UeauLog.Infof("[Auth]   XRES         = [%x]", RES)
+	logger.UeauLog.Infof("[Auth] ── End auth for %s ──", supiOrSuci)
 
 	var av models.AuthenticationVector
 	if authSubs.AuthenticationSubscription.AuthenticationMethod == models.AuthMethod__5_G_AKA {
@@ -457,7 +491,6 @@ func (p *Processor) GenerateAuthDataProcedure(
 			logger.UeauLog.Errorf("Get kdfValForXresStar err: %+v", err)
 		}
 		xresStar := kdfValForXresStar[len(kdfValForXresStar)/2:]
-		logger.UeauLog.Tracef("xresStar=[%x]", xresStar)
 
 		// derive Kausf
 		FC = ueauth.FC_FOR_KAUSF_DERIVATION
@@ -467,7 +500,6 @@ func (p *Processor) GenerateAuthDataProcedure(
 		if err != nil {
 			logger.UeauLog.Errorf("Get kdfValForKausf err: %+v", err)
 		}
-		logger.UeauLog.Tracef("Kausf=[%x]", kdfValForKausf)
 
 		// Fill in rand, xresStar, autn, kausf
 		av.Rand = hex.EncodeToString(RAND)
@@ -486,15 +518,9 @@ func (p *Processor) GenerateAuthDataProcedure(
 		if err != nil {
 			logger.UeauLog.Errorf("Get kdfVal err: %+v", err)
 		}
-		logger.UeauLog.Tracef("kdfVal=[%x] (len=%d)", kdfVal, len(kdfVal))
-
-		// For TS 35.208 test set 19 & RFC 5448 test vector 1
-		// CK': 0093 962d 0dd8 4aa5 684b 045c 9edf fa04
-		// IK': ccfc 230c a74f cc96 c0a5 d611 64f5 a76
 
 		ckPrime := kdfVal[:len(kdfVal)/2]
 		ikPrime := kdfVal[len(kdfVal)/2:]
-		logger.UeauLog.Tracef("ckPrime=[%x], kPrime=[%x]", ckPrime, ikPrime)
 
 		// Fill in rand, xres, autn, ckPrime, ikPrime
 		av.Rand = hex.EncodeToString(RAND)
