@@ -181,7 +181,7 @@ func (p *Processor) GenerateAuthDataProcedure(
 
 	hasOPC := false
 	var kStr, opcStr string
-	var k, op, opc []byte
+	var k, opc []byte
 	if authSubs.AuthenticationSubscription.EncPermanentKey != "" {
 		kStr = authSubs.AuthenticationSubscription.EncPermanentKey
 		if len(kStr) == keyStrLen {
