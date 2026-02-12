@@ -336,18 +336,10 @@ func (p *Processor) GenerateAuthDataProcedure(
 				return
 			}
 
-			// increment sqn authSubs.SequenceNumber
-			bigSQN := big.NewInt(0)
+			// Re-sync: use SQN decoded from UE's AUTS (SQNms)
+			// The post-resync increment block below will add +1
 			sqnStr = hex.EncodeToString(SQNms)
-			logger.UeauLog.Tracef("SQNstr=[%s]", sqnStr)
-			bigSQN.SetString(sqnStr, 16)
-
-			bigInc := big.NewInt(ind + 1)
-
-			bigP := big.NewInt(SqnMAx)
-			bigSQN = bigInc.Add(bigSQN, bigInc)
-			bigSQN = bigSQN.Mod(bigSQN, bigP)
-			sqnStr = fmt.Sprintf("%x", bigSQN)
+			logger.UeauLog.Tracef("Re-sync SQNms=[%s]", sqnStr)
 			sqnStr = p.strictHex(sqnStr, 12)
 		} else {
 			logger.UeauLog.Errorf("Re-Sync MAC failed for UE with identity supiOrSuci=[%s], resolvedSupi=[%s]", supiOrSuci, supi)
