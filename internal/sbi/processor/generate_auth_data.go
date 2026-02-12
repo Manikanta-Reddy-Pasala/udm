@@ -439,6 +439,12 @@ func (p *Processor) GenerateAuthDataProcedure(
 
 	logger.UeauLog.Infof("[Auth] SQN saved to DB: [%s]", SQNheStr)
 
+	// Update sqn bytes to the incremented value so auth vector uses SQN+1
+	sqn, err = hex.DecodeString(SQNheStr)
+	if err != nil {
+		logger.UeauLog.Errorln("err decoding incremented SQN:", err)
+	}
+
 	// Run milenage
 	macA, macS := make([]byte, 8), make([]byte, 8)
 	CK, IK := make([]byte, 16), make([]byte, 16)
